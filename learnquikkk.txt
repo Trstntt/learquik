@@ -504,8 +504,223 @@ flutter:
   assets:
     - lib/assets/images/
 
+==============================================================================
+
+generate_quiz.php
+
+<?php
+// generate_quiz.php
+// POST params (application/json or form-encoded):
+// - lesson_id (int)
+// - selected_material_ids (array of ints) OR selected_material_files (array of file paths)
+// - quiz_type ("multiple_choice" or "identification")
+// - num_questions (int) optional, default 10
+// Response: JSON { success: true, quiz: { title, questions: [...] } } or { success:false, error: "..." }
+
+header("Access-Control-Allow-Origin: *");
+header("Access-Control-Allow-Headers: Content-Type");
+header("Content-Type: application/json");
+
+require_once __DIR__ . "/db.php"; // your DB connection
+
+// read input (supports JSON body or form-encoded)
+$inputJson = file_get_contents("php://input");
+$input = json_decode($inputJson, true);
+if (!$input) {
+    $input = $_POST;
+}
+
+$lessonId = isset($input['lesson_id']) ? intval($input['lesson_id']) : 0;
+$selectedMaterialIds = $input['selected_material_ids'] ?? []; // array of ints
+$quizType = $input['quiz_type'] ?? 'multiple_choice';
+$numQuestions = isset($input['num_questions']) ? intval($input['num_questions']) : 10;
+
+if ($lessonId <= 0 || empty($selectedMaterialIds) || !is_array($selectedMaterialIds)) {
+    echo json_encode(["success" => false, "error" => "Missing required fields: lesson_id and selected_material_ids"]);
+    exit;
+}
+
+// Fetch materials records from DB
+$placeholders = implode(",", array_fill(0, count($selectedMaterialIds), "?"));
+$sql = "SELECT id, file_name, file_path FROM materials WHERE id IN ($placeholders)";
+$stmt = $conn->prepare($sql);
+$types = str_repeat("i", count($selectedMaterialIds));
+$stmt->bind_param($types, ...array_map('intval', $selectedMaterialIds));
+$stmt->execute();
+$result = $stmt->get_result();
+
+$materials = [];
+while ($r = $result->fetch_assoc()) {
+    $materials[] = $r;
+}
+$stmt->close();
+
+if (empty($materials)) {
+    echo json_encode(["success" => false, "error" => "No materials found for given ids"]);
+    exit;
+}
+
+// Helper: read file content or extract PDF text
+function extract_text_from_material($file_path) {
+    // Correct path to point to the /uploads folder inside /api
+    $full_path = __DIR__ . "/uploads/" . basename($file_path);
+
+    if (!file_exists($full_path)) {
+        error_log("⚠️ File not found: $full_path"); // helps debug
+        return "";
+    }
+
+    $ext = strtolower(pathinfo($full_path, PATHINFO_EXTENSION));
+
+    if (in_array($ext, ['txt', 'md', 'html', 'htm'])) {
+        return file_get_contents($full_path);
+    }
+
+    if ($ext === 'pdf') {
+        // If it's a PDF, try extracting text using pdftotext (if installed)
+        $outputTmp = tempnam(sys_get_temp_dir(), 'txt');
+        $cmd = "pdftotext " . escapeshellarg($full_path) . " " . escapeshellarg($outputTmp) . " 2>/dev/null";
+        @exec($cmd);
+        if (file_exists($outputTmp)) {
+            $txt = file_get_contents($outputTmp);
+            @unlink($outputTmp);
+            return $txt ?: "";
+        } else {
+            return "";
+        }
+    }
+
+    // fallback: try reading file as text
+    return file_get_contents($full_path);
+}
 
 
+// Build combined text (limit length)
+$combined = "";
+foreach ($materials as $m) {
+    $text = extract_text_from_material($m['file_path']);
+    $combined .= "\n\n=== FILE: " . ($m['file_name'] ?? 'file') . " ===\n\n";
+    $combined .= substr($text, 0, 25000); // limit per file
+}
+
+// If combined is empty -> error
+if (trim($combined) === "") {
+    echo json_encode(["success" => false, "error" => "Could not extract text from selected materials. Ensure files are text or install pdftotext for PDFs."]);
+    exit;
+}
+
+// Build prompt (strict JSON output)
+$quizTitle = "Quiz for Lesson #$lessonId";
+$requested = intval(max(1, min(10, $numQuestions)));
+
+$systemPrompt = "You are a helpful teaching assistant that creates quizzes from provided study material. ALWAYS OUTPUT VALID JSON and nothing else. The JSON MUST parse. The schema must be:
+
+{
+  \"title\": \"...\",         // string
+  \"source_lesson_id\": ...,  // int
+  \"quiz_type\": \"multiple_choice\" | \"identification\",
+  \"questions\": [
+    {
+      \"id\": 1,
+      \"question\": \"...\",         // string
+      // for multiple_choice:
+      \"options\": [\"optA\",\"optB\",\"optC\",\"optD\"], // 3-5 options
+      \"answer\": \"optB\"          // exact one of the provided options
+      // for identification:
+      // \"answer\": \"...\"         // the short correct answer
+      // optional: \"explanation\": \"...\"
+    },
+    ...
+  ]
+}
+
+Do NOT include any commentary, explanation, or extra fields. Make each question concise. Use plain text only.";
+
+$userPrompt = "Create a {$quizType} quiz with {$requested} questions from the following study material. Use only the material; avoid trivia outside of it. If insufficient information for {$requested} questions, generate as many high-quality questions as the material allows.
+
+STUDY MATERIAL START:
+$combined
+STUDY MATERIAL END.
+
+Produce JSON exactly in the schema specified in the system prompt. Title should be '{$quizTitle}'. source_lesson_id: {$lessonId}. quiz_type: {$quizType}.
+";
+
+// Call OpenAI API
+$openai_key = "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";
+if (!$openai_key) {
+    echo json_encode(["success" => false, "error" => "OpenAI API key not configured on server (OPENAI_API_KEY)."]);
+    exit;
+}
+
+// Build request payload (chat completions)
+$payload = [
+    "model" => "gpt-4o-mini", // change if needed
+    "messages" => [
+        ["role" => "system", "content" => $systemPrompt],
+        ["role" => "user", "content" => $userPrompt]
+    ],
+    "temperature" => 0.2,
+    "max_tokens" => 1500
+];
+
+$ch = curl_init();
+curl_setopt($ch, CURLOPT_URL, "https://api.openai.com/v1/chat/completions");
+curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+curl_setopt($ch, CURLOPT_HTTPHEADER, [
+    "Content-Type: application/json",
+    "Authorization: Bearer " . $openai_key
+]);
+curl_setopt($ch, CURLOPT_POST, true);
+curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
+$response = curl_exec($ch);
+$httpcode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+$curlErr = curl_error($ch);
+curl_close($ch);
+
+if ($response === false) {
+    echo json_encode(["success" => false, "error" => "OpenAI request failed: $curlErr"]);
+    exit;
+}
+
+if ($httpcode < 200 || $httpcode >= 300) {
+    echo json_encode(["success" => false, "error" => "OpenAI returned HTTP $httpcode", "body" => $response]);
+    exit;
+}
+
+// Parse model output
+$respJson = json_decode($response, true);
+
+// Chat completions -> content is at choices[0].message.content
+$generatedText = null;
+if (isset($respJson['choices'][0]['message']['content'])) {
+    $generatedText = $respJson['choices'][0]['message']['content'];
+} elseif (isset($respJson['choices'][0]['text'])) {
+    $generatedText = $respJson['choices'][0]['text'];
+} else {
+    echo json_encode(["success" => false, "error" => "Unexpected OpenAI response", "raw" => $respJson]);
+    exit;
+}
+
+// The model was instructed to produce JSON only. Try to locate JSON in the output.
+$firstBrace = strpos($generatedText, "{");
+if ($firstBrace !== false) {
+    $jsonCandidate = substr($generatedText, $firstBrace);
+} else {
+    $jsonCandidate = $generatedText;
+}
+
+$final = json_decode($jsonCandidate, true);
+if ($final === null) {
+    // attempt to sanitize (strip leading/trailing partial quotes)
+    // fallback: return raw text for debugging
+    echo json_encode(["success" => false, "error" => "Failed to parse JSON from LLM output", "llm_output" => $generatedText]);
+    exit;
+}
+
+// success
+echo json_encode(["success" => true, "quiz" => $final]);
+exit;
+?>
 
 
 
